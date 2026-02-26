@@ -11,16 +11,68 @@ mod interrupts;
 mod gdt;
 
 use core::panic::PanicInfo;
+use bootloader::{BootInfo, entry_point};
+use x86_64::structures::paging::mapper;
+
+
+entry_point!(kernel_main);
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
+
+    use tutorial_os::memory;
+    use x86_64::{structures::paging::Translate, VirtAddr, structures::paging::Page};
+    use tutorial_os::memory::BootInfoFrameAllocator;
+
+
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    let mut mapper = unsafe { memory::init(phys_mem_offset)};
+    let mut frame_allocator = memory::EmptyFrameAllocator;
+
+    let mut frame_allocator = unsafe {
+        BootInfoFrameAllocator::init(&boot_info.memory_map)
+    };
+
+
+    let page = Page::containing_address(VirtAddr::new(0));
+    memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
+    println!("Mapping created!");
+
+    let page_ptr: *mut u64 = page.start_address().as_mut_ptr();
+    unsafe { page_ptr.offset(400).write_volatile(0x_f021_f077_f065_f04e)};
+
     println!("Hello World!");
     
     tutorial_os::init();
+
+    let addresses = [
+        0xb8000,
+        0x201008,
+        0x0100_0020_1a10,
+        boot_info.physical_memory_offset,
+    ];
+    
     
     // El breakpoint está comentado para que no aparezca siempre
     // x86_64::instructions::interrupts::int3();
+
     
+    use x86_64::registers::control::Cr3;
+
+    let (level_4_page_table, _) = Cr3::read();
+    println!("Level 4 page page table at: {:?}", level_4_page_table.start_address());
+    
+    
+
+    
+
+    for &address in &addresses {
+        let virt = VirtAddr::new(address);
+        let phys = mapper.translate_addr(virt);
+        println!("{:?} -> {:?}", virt, phys);
+    }
+
+    //--------
     #[cfg(test)]
     test_main();
     
