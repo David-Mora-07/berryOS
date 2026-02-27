@@ -12,7 +12,10 @@ mod gdt;
 
 use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
+use tutorial_os::allocator;
 use x86_64::structures::paging::mapper;
+use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
+extern crate alloc;
 
 
 entry_point!(kernel_main);
@@ -71,6 +74,23 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         let phys = mapper.translate_addr(virt);
         println!("{:?} -> {:?}", virt, phys);
     }
+
+
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    let heap_value = Box::new(41);
+    println!("heap_value at {:p}", heap_value);
+
+    let mut vec = Vec::new();
+    for i in 0..500 {
+        vec.push(i);
+    }
+    println!("vec at {:p}", vec.as_slice());
+
+    let reference_counted = Rc::new(vec![1, 2, 3]);
+    let cloned_reference = reference_counted.clone();
+    println!("current reference count is {}", Rc::strong_count(&cloned_reference));
+    core::mem::drop(reference_counted);
+    println!("reference count is {} now", Rc::strong_count(&cloned_reference));
 
     //--------
     #[cfg(test)]
