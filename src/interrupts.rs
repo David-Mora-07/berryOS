@@ -1,16 +1,16 @@
 #![allow(dead_code)]
 
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
-use spin;
-use crate::{print, println,};
+use spin::Mutex;
+use crate::{print, println};
+// Usamos crate:: para referirnos a nuestra propia librería definida en lib.rs
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-pub static PICS: spin::Mutex<ChainedPics> =
-    spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -30,6 +30,11 @@ impl InterruptIndex {
 }
 
 lazy_static! {
+    // Definimos el Shell dentro de un Mutex para que sea seguro acceder desde la interrupción
+    static ref SHELL: Mutex<Shell> = Mutex::new(Shell::new());
+}
+
+lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
         idt.breakpoint.set_handler_fn(breakpoint_handler);
@@ -38,65 +43,10 @@ lazy_static! {
             .set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_usize()]
             .set_handler_fn(keyboard_interrupt_handler);
+        idt.page_fault.set_handler_fn(page_fault_handler);
         idt
     };
 }
-
-use x86_64::structures::idt::PageFaultErrorCode;
-pub fn hlt_loop() -> ! {
-    loop{
-        x86_64::instructions::hlt();
-    }
-}
-
-extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
-    error_code: PageFaultErrorCode,
-) {
-    use x86_64::registers::control::Cr2;
-
-    println!("EXCEPTION: PAGE FAULT");
-    println!("Accessed Address: {:?}", Cr2::read());
-    println!("Error Code: {:?}", error_code);
-    println!("{:#?}", stack_frame);
-    hlt_loop();
-}
-
-
-extern "x86-interrupt" fn keyboard_interrupt_handler(
-    _stack_frame: InterruptStackFrame)
-{
-    use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
-    use spin::Mutex;
-    use x86_64::instructions::port::Port;
-
-    lazy_static! {
-        static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
-            Mutex::new(Keyboard::new(ScancodeSet1::new(),
-                layouts::Us104Key, HandleControl::Ignore)
-            );
-    }
-
-    let mut keyboard = KEYBOARD.lock();
-    let mut port = Port::new(0x60);
-
-    let scancode: u8 = unsafe { port.read() };
-    if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
-        if let Some(key) = keyboard.process_keyevent(key_event) {
-            match key {
-                DecodedKey::Unicode(character) => print!("{}", character),
-                DecodedKey::RawKey(key) => print!("{:?}", key),
-            }
-        }
-    }
-
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
-    }
-}
-
-
 
 pub fn init_idt() {
     IDT.load();
@@ -118,7 +68,8 @@ extern "x86-interrupt" fn double_fault_handler(
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
-    print!(".");
+    // Opcional: imprimir un punto para ver que el timer funciona
+    // print!(".");
 
     unsafe {
         PICS.lock()
@@ -126,7 +77,114 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     }
 }
 
-#[test_case]
-fn test_breakpoint_exception() {
-    x86_64::instructions::interrupts::int3();
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    use x86_64::registers::control::Cr2;
+
+    println!("EXCEPTION: PAGE FAULT");
+    println!("Accessed Address: {:?}", Cr2::read());
+    println!("Error Code: {:?}", error_code);
+    println!("{:#?}", stack_frame);
+    loop { x86_64::instructions::hlt(); }
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(
+    _stack_frame: InterruptStackFrame)
+{
+    use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
+    use x86_64::instructions::port::Port;
+
+    lazy_static! {
+        static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
+            Mutex::new(Keyboard::new(
+                ScancodeSet1::new(),
+                layouts::Us104Key,
+                HandleControl::Ignore
+            ));
+    }
+
+    let mut keyboard = KEYBOARD.lock();
+    let mut port = Port::new(0x60);
+    
+    let scancode: u8 = unsafe { port.read() };
+    if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
+        if let Some(key) = keyboard.process_keyevent(key_event) {
+            match key {
+                DecodedKey::Unicode(character) => {
+                    // Llamamos al shell para que procese la tecla
+                    spin::Mutex::lock(&SHELL).handle_key(character);
+                },
+                DecodedKey::RawKey(key) => print!("{:?}", key),
+            }
+        }
+    }
+
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+
+//Workaround for shell.rs not importing, might fix later
+use alloc::string::String;
+
+pub struct Shell {
+    input: String,
+}
+
+impl Shell {
+    pub fn new() -> Self {
+        Shell {
+            input: String::new(),
+        }
+    }
+
+    pub fn handle_key(&mut self, key: char) {
+        match key {
+            '\n' => {
+                println!();
+                self.execute();
+                print!("> ");
+            }
+            '\x08' => {
+                self.input.pop();
+                print!("{}", key);
+            }
+            c => {
+                self.input.push(c);
+                print!("{}", c);
+            }
+        }
+    }
+
+    fn execute(&mut self) {
+    match self.input.trim() {  // ← AÑADE .trim()
+        "help" => println!("Commands: help, clear, echo, info, exit"),
+        "clear" => {
+            for _ in 0..50 {
+                println!();
+            }
+        }
+        cmd if cmd.starts_with("echo ") => {
+            println!("{}", &cmd[5..]);
+        }
+        "info" => {
+            println!("Kernel v0.1.0 | berryOS v0.1.0 - x86_64");
+        }
+        "exit" => {
+            println!("shuting down...");
+            use x86_64::instructions::port::Port;
+            unsafe {
+                let mut port = Port::new(0x604);
+                port.write(0x2000 as u16);
+                println!("If it doesn't shut down in a second please, shutdown manually")
+            }
+        }
+        _ => println!("Command not found: {}", self.input),
+    }
+    self.input.clear();
+}
 }
